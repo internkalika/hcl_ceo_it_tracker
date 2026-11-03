@@ -281,6 +281,11 @@ input,select{font:inherit;font-size:.875rem;width:100%;border:1px solid var(--li
 .dlg-box .stat{border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-size:.75rem;color:var(--ink-soft)}
 .dlg-box .stat b{display:block;font-size:1.25rem;color:var(--ink);line-height:1.2}
 .dlg-box .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+.dlg-box form input{margin-top:12px}
+.dlg-box ul.hist{list-style:none;margin-top:12px;display:grid;gap:6px}
+.dlg-box ul.hist li{display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:.8125rem;color:var(--ink-soft)}
+.dlg-box ul.hist b{color:var(--ink)}
+.dlg-box .loading{padding:24px;color:var(--ink-soft)}
 .dlg-box summary{cursor:pointer;margin-top:12px;font-size:.875rem;font-weight:600}
 @media(max-width:639px){#import-btn{padding:8px 10px}}
 /* gantt */
@@ -2125,16 +2130,38 @@ let D, P, byId, importedFrom = null;
 function setData(d) { D = d; STATUS_ORDER = d.statusOrder; P = d.projects; byId = new Map(P.map((p) => [p.id, p])); }
 const todayNow = () => ENGINE.today(window.__HERO_TODAY__);
 const rebuild = (source) => ENGINE.build(source, todayNow(), EMBEDDED.data.meta.logo);
-/* The data shown: an Excel file imported earlier in this browser, else the file this page was built from.
-   Either way it is worked out again for today's date, so "due in 8 days" never goes stale. */
+/* The data shown, in order of preference:
+     1. an Excel import made in THIS browser that is newer than the last publish (a private preview, not yet published);
+     2. the data published for everyone (served by /api/data from private Vercel Blob; no redeploy needed);
+     3. the file this page was built from (offline / first-run fallback).
+   Whichever is used, it is worked out again for today's date, so "due in 8 days" never goes stale. */
+let published = null, pending = null, auth = null, ready = false;
 function loadInitial() {
-  let source = EMBEDDED.source;
-  importedFrom = null;
+  let local = null;
   try {
     const o = JSON.parse(localStorage.getItem(STORE) || "null");
-    if (o && o.source && o.source.projects && o.source.projects.length) { source = o.source; importedFrom = source.fileName; }
-  } catch (e) { /* storage unavailable: use the built-in data */ }
-  try { setData(rebuild(source)); } catch (e) { setData(EMBEDDED.data); importedFrom = null; }
+    if (o && o.source && o.source.projects && o.source.projects.length) local = o;
+  } catch (e) { /* storage unavailable: skip the local preview */ }
+  const tries = [];
+  if (local && (!published || (local.at || 0) > Date.parse(published.publishedAt))) tries.push({ source: local.source, local: true });
+  if (published) tries.push({ source: published.source, pub: true });
+  tries.push({ source: EMBEDDED.source, embedded: true });
+  importedFrom = null;
+  for (const t of tries) {
+    try { setData(rebuild(t.source)); importedFrom = t.local ? t.source.fileName : null; return; } catch (e) { if (t.pub) published = null; }
+  }
+  setData(EMBEDDED.data); importedFrom = null;
+}
+/* The published data, or null (nothing published yet, offline, or anything unexpected: the page then uses its fallback). */
+async function fetchPublished(bust) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const r = await fetch("/api/data" + (bust ? "?v=" + encodeURIComponent(bust) : ""), { cache: "no-cache", credentials: "omit", signal: ctl.signal, headers: { Accept: "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j && j.schemaVersion === 1 && typeof j.version === "string" && typeof j.publishedAt === "string" && j.source && Array.isArray(j.source.projects) && j.source.projects.length) return { version: j.version, publishedAt: j.publishedAt, source: j.source };
+  } catch (e) { /* offline or blocked: fall back */ } finally { clearTimeout(timer); }
+  return null;
 }
 
 /* ---------- helpers ---------- */
@@ -2144,6 +2171,7 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":
 const fmtDate = (iso) => { if (!iso) return ""; const [y, m, d] = iso.split("-").map(Number); return d + " " + MON[m - 1] + " " + y; };
 const plural = (n, a, b) => n + " " + (n === 1 ? a : (b || a + "s"));
 const monthLabel = (ym) => MONTHS[Number(ym.slice(5, 7)) - 1] + " " + ym.slice(0, 4);
+const fmtStamp = (iso) => new Intl.DateTimeFormat("en-GB", { timeZone: TZ, day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso)) + " IST";
 const dayInZone = (iso) => new Intl.DateTimeFormat("en-GB", { timeZone: TZ, day: "numeric", month: "short", year: "numeric" }).format(new Date(iso));
 const cmpStr = (a, b) => a.localeCompare(b, "en", { sensitivity: "base", numeric: true });
 const clampPct = (n, t) => (t ? Math.round((n / t) * 100) : 0);
@@ -2578,16 +2606,19 @@ function shell() {
   document.getElementById("logo").innerHTML = m.logo ? '<img src="' + m.logo + '" alt="Hero Cycles">' : "<b>Hero Cycles</b>";
   document.getElementById("burger").innerHTML = ic("menu");
   document.getElementById("appname").textContent = m.appName;
-  const line = (compact) => '<i aria-hidden="true"></i><span>' + (compact ? "" : esc(m.fileName) + " · ") + plural(P.length, "project") + " · data as of " + esc(m.asOf) + "</span>";
+  const line = (compact) => '<i aria-hidden="true"></i><span>' + (compact ? "" : esc(m.fileName) + " · ") + plural(P.length, "project") + " · data as of " + esc(m.asOf) + (published && !importedFrom && !compact ? " · published " + esc(fmtStamp(published.publishedAt)) : "") + "</span>";
   document.getElementById("status-line").innerHTML = line(false);
   document.getElementById("status-mobile").innerHTML = '<p class="status-line">' + line(true) + "</p>";
   document.getElementById("import-btn").innerHTML = ic("upload") + "Import";
   paintTheme();
   document.getElementById("today").textContent = fmtDate(m.today);
   const mail = document.getElementById("mail"); mail.href = "mailto:" + m.supportEmail; mail.textContent = m.supportEmail;
+  const tools = ' <a href="#/" id="pub-tools">Publisher tools</a>';
   document.getElementById("snap").innerHTML = importedFrom
-    ? "Showing " + esc(m.fileName) + " (sheet &quot;" + esc(m.sheetName) + "&quot;), imported in this browser only. <a href=\"#/\" id=\"reset\">Go back to the original data</a>"
-    : "Built from " + esc(m.fileName) + " (sheet &quot;" + esc(m.sheetName) + "&quot;). Use Import (top right) to load a newer Excel file.";
+    ? "Showing " + esc(m.fileName) + " (sheet &quot;" + esc(m.sheetName) + "&quot;), imported in this browser only and not published. <a href=\"#/\" id=\"reset\">" + (published ? "Go back to the published data" : "Go back to the original data") + "</a>" + tools
+    : published
+      ? "Published data from " + esc(m.fileName) + " (sheet &quot;" + esc(m.sheetName) + "&quot;), last published " + esc(fmtStamp(published.publishedAt)) + "." + tools
+      : "Built from " + esc(m.fileName) + " (sheet &quot;" + esc(m.sheetName) + "&quot;). Use Import (top right) to load a newer Excel file." + tools;
 }
 function paintTheme() {
   const dark = document.documentElement.dataset.theme === "dark", b = document.getElementById("theme-btn");
@@ -2611,6 +2642,7 @@ document.getElementById("skip").addEventListener("click", (e) => { e.preventDefa
 const TITLES = { "/": "Dashboard", "/projects": "All Projects", "/timeline": "Project Timeline", "/help": "Help & Contact" };
 let lastPath = null;
 function render() {
+  if (!ready) return; // the first paint waits for the published data (or its fallback)
   const raw = location.hash.replace(/^#/, "") || "/";
   const qi = raw.indexOf("?");
   const path = (qi < 0 ? raw : raw.slice(0, qi)).replace(/\/+$/, "") || "/";
@@ -2636,7 +2668,7 @@ window.addEventListener("hashchange", render);
 
 /* filter form: dropdowns apply straight away, the search box on Enter / Search */
 document.addEventListener("change", (e) => { const f = e.target.closest && e.target.closest("#flt"); if (f && e.target.name !== "q") goFilters(f); });
-document.addEventListener("submit", (e) => { if (e.target.id === "flt") { e.preventDefault(); goFilters(e.target); } });
+document.addEventListener("submit", (e) => { if (e.target.id === "pub-form") { e.preventDefault(); submitLogin(e.target); return; } if (e.target.id === "flt") { e.preventDefault(); goFilters(e.target); } });
 function goFilters(form) {
   const p = new URLSearchParams();
   new FormData(form).forEach((v, k) => { if (String(v).trim() !== "") p.set(k, String(v).trim()); });
@@ -2732,7 +2764,7 @@ async function doImport(file) {
     if (!/\.xlsx$/i.test(file.name)) throw new Error("Import an Excel workbook (.xlsx).");
     const res = await ENGINE.readWorkbook(new Uint8Array(await file.arrayBuffer()), file.name, file.lastModified);
     const next = rebuild(res.source), diff = compare(P, next.projects);
-    setData(next); importedFrom = file.name;
+    setData(next); importedFrom = file.name; pending = { source: res.source };
     let kept = true;
     try { localStorage.setItem(STORE, JSON.stringify({ source: res.source, at: Date.now() })); } catch (e) { kept = false; }
     shell();
@@ -2741,12 +2773,95 @@ async function doImport(file) {
     openDialog('<h2 class="ok">' + ic("check") + "Dashboard updated</h2><p>" + esc(file.name) + " is loaded: " + plural(next.projects.length, "project") + ' read from the sheet "' + esc(res.source.sheetName) + '". Every card and chart now shows it.</p>' +
       '<div class="stats">' + stat(diff.added, "new") + stat(diff.changed, "changed") + stat(diff.same, "unchanged") + stat(diff.removed, "no longer in the file") + "</div>" +
       (diff.removed ? "<p>Projects that are not in this file are no longer shown (this page shows exactly the file you import).</p>" : "") +
-      (kept ? "<p>Remembered in this browser, so it is still here next time you open this file. Use &ldquo;Go back to the original data&rdquo; at the bottom of the page to undo.</p>" : "<p><b>Note:</b> this browser would not let the page remember the import, so it will be lost when you close the page.</p>") +
+      (kept ? "<p>Remembered in this browser, so it is still here next time you open this file. Use the &ldquo;Go back&rdquo; link at the bottom of the page to undo.</p>" : "<p><b>Note:</b> this browser would not let the page remember the import, so it will be lost when you close the page.</p>") +
       (res.notes.length ? "<details><summary>Notes about this file (" + res.notes.length + ')</summary><ul class="notes">' + res.notes.map((n) => "<li>" + esc(n) + "</li>").join("") + "</ul></details>" : "") +
-      '<div class="acts"><button class="btn primary" type="button" data-close data-focus>Done</button><a class="btn" href="#/projects" data-close>View all projects</a></div>');
+      '<p><b>This is a preview in this browser only.</b> Publish it to update the dashboard for everyone.</p><div class="acts"><button class="btn primary" type="button" id="publish-now" data-focus>' + ic("upload") + 'Publish for everyone</button><button class="btn" type="button" data-close>Done</button><a class="btn" href="#/projects" data-close>View all projects</a></div>');
   } catch (e) {
     openDialog('<h2 class="bad">' + ic("xcircle") + "Nothing was changed</h2><p>" + esc(friendly(e)) + "</p>" + '<p>The dashboard still shows what it showed before. The file needs a sheet with a project name, an expected date and a current-status column (a Status column is optional).</p><div class="acts"><button class="btn primary" type="button" data-close data-focus>Close</button></div>');
   }
+}
+/* ---------- publishing: sign in with the shared passphrase, publish, history and restore ----------
+   The browser only ever holds a short-lived HttpOnly cookie (which scripts cannot read) and a per-session CSRF token.
+   Blob tokens, the passphrase and the signing secret live on the server and are never sent here. */
+async function api(path, opts) {
+  try {
+    const r = await fetch(path, Object.assign({ credentials: "same-origin", cache: "no-store" }, opts));
+    let j = null; try { j = await r.json(); } catch (e) { /* no body */ }
+    return { ok: r.ok, status: r.status, json: j || {} };
+  } catch (e) { return { ok: false, status: 0, json: { message: "Could not reach the server. Check your connection and try again." } }; }
+}
+const postJson = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": auth ? auth.csrf : "" }, body: JSON.stringify(body) });
+async function checkAuth() {
+  const r = await api("/api/auth");
+  auth = r.ok && r.json.authenticated ? { csrf: r.json.csrfToken } : null;
+  return { configured: r.status !== 503 && r.status !== 404 && r.status !== 0, signedIn: !!auth };
+}
+const msgDialog = (cls, icon, title, body, extra) => openDialog('<h2 class="' + cls + '">' + ic(icon) + esc(title) + "</h2><p>" + esc(body) + "</p>" + (extra || "") + '<div class="acts"><button class="btn primary" type="button" data-close data-focus>Close</button></div>');
+let afterLogin = null;
+function loginDialog(next, note) {
+  afterLogin = next;
+  openDialog("<h2>Publisher sign-in</h2><p>Enter the publishing passphrase to continue. Viewing the dashboard never needs one.</p>" + (note ? '<p class="bad">' + esc(note) + "</p>" : "") +
+    '<form id="pub-form" autocomplete="off"><input type="password" id="pub-pass" name="passphrase" autocomplete="current-password" aria-label="Publishing passphrase" required data-focus>' +
+    '<div class="acts"><button class="btn primary" type="submit">Sign in</button><button class="btn" type="button" data-close>Cancel</button></div></form>');
+}
+async function submitLogin(form) {
+  const input = form.querySelector("#pub-pass"), passphrase = input.value;
+  input.value = ""; // never keep the passphrase in the page
+  const r = await postJson("/api/auth", { passphrase });
+  if (r.ok && r.json.authenticated) { auth = { csrf: r.json.csrfToken }; const n = afterLogin; afterLogin = null; if (n) n(); else closeDialog(); return; }
+  const msg = r.status === 401 ? "That passphrase is not correct." : r.status === 429 ? "Too many failed attempts. Please wait a few minutes and try again." : r.status === 503 ? "Publishing is not set up on this deployment." : (r.json.message || "Could not sign in.");
+  loginDialog(afterLogin, msg);
+}
+async function startPublish(force) {
+  if (!pending) { msgDialog("bad", "xcircle", "Nothing to publish", "Import an Excel file first, then publish it."); return; }
+  openDialog('<h2>Publishing...</h2><p class="loading">Checking your sign-in.</p>');
+  const st = await checkAuth();
+  if (!st.configured) { msgDialog("bad", "xcircle", "Publishing is not available", "Publishing is not set up on this deployment (or this page is not being served from the dashboard site). Your preview is unchanged."); return; }
+  if (!st.signedIn) { loginDialog(() => startPublish(force)); return; }
+  openDialog('<h2>Publishing...</h2><p class="loading">Sending ' + plural(pending.source.projects.length, "project") + " to the dashboard.</p>");
+  const body = { action: "publish", source: pending.source };
+  if (!force) body.baseVersion = published ? published.version : null;
+  const r = await postJson("/api/publish", body);
+  if (r.ok && r.json.ok) {
+    published = { version: r.json.version, publishedAt: r.json.publishedAt, source: pending.source };
+    pending = null;
+    try { localStorage.removeItem(STORE); } catch (e) { /* ignore */ }
+    loadInitial(); shell(); render();
+    openDialog('<h2 class="ok">' + ic("check") + "Published</h2><p>" + plural(r.json.projectCount, "project") + " from " + esc(r.json.fileName) + " are now live for everyone. Viewers see them the next time they open or refresh the dashboard (within about 10 seconds).</p><p>Published " + esc(fmtStamp(r.json.publishedAt)) + '.</p><div class="acts"><button class="btn primary" type="button" data-close data-focus>Done</button></div>');
+  } else if (r.status === 401 || r.json.error === "bad_csrf") {
+    auth = null; loginDialog(() => startPublish(force), "Your sign-in expired. Please sign in again.");
+  } else if (r.status === 409) {
+    msgDialog("bad", "xcircle", "Newer data exists", r.json.message || "The published data changed.");
+    document.querySelector("#dlg-content .acts").insertAdjacentHTML("afterbegin", '<button class="btn" type="button" id="pub-anyway">Publish anyway</button>');
+  } else {
+    msgDialog("bad", "xcircle", "Nothing was published", r.json.message || "Something went wrong. Please try again.");
+  }
+}
+async function openTools() {
+  openDialog('<h2>Publisher tools</h2><p class="loading">Loading...</p>');
+  const st = await checkAuth();
+  if (!st.configured) { msgDialog("bad", "xcircle", "Publishing is not available", "Publishing is not set up on this deployment (or this page is not being served from the dashboard site)."); return; }
+  if (!st.signedIn) { loginDialog(openTools); return; }
+  const r = await api("/api/publish");
+  if (r.status === 401) { auth = null; loginDialog(openTools, "Your sign-in expired. Please sign in again."); return; }
+  if (!r.ok) { msgDialog("bad", "xcircle", "Could not load history", r.json.message || "Please try again."); return; }
+  const cur = r.json.current, rows = r.json.history || [];
+  const what = (h) => (h.action === "rollback" ? "Restored version" : esc(h.fileName)) + " &middot; " + plural(h.projectCount, "project");
+  openDialog("<h2>Publisher tools</h2>" + (cur ? "<p>Live now: " + what(cur) + ", published " + esc(fmtStamp(cur.publishedAt)) + ".</p>" : "<p>Nothing has been published yet. Import an Excel file, then choose Publish.</p>") +
+    (rows.length ? "<p>Recent versions. Restoring one publishes it again for everyone and is itself recorded, so you can undo it.</p>" : "") +
+    '<ul class="hist">' + rows.map((h) => "<li><span><b>" + esc(fmtStamp(h.publishedAt)) + "</b><br>" + what(h) + "</span>" +
+      (cur && h.version === cur.version ? '<span class="tag">Live</span>' : '<button class="btn s" type="button" data-restore="' + esc(h.version) + '" data-base="' + esc(cur ? cur.version : "") + '">Restore</button>') + "</li>").join("") + "</ul>" +
+    '<div class="acts"><button class="btn primary" type="button" data-close data-focus>Done</button><button class="btn" type="button" id="pub-signout">Sign out</button></div>');
+}
+async function restoreVersion(version, base) {
+  openDialog('<h2>Restoring...</h2><p class="loading">Publishing the earlier version again.</p>');
+  const r = await postJson("/api/publish", { action: "rollback", version, baseVersion: base || null });
+  if (r.ok && r.json.ok) {
+    const p = await fetchPublished(r.json.version);
+    if (p) { published = p; loadInitial(); shell(); render(); }
+    openTools();
+  } else if (r.status === 401 || r.json.error === "bad_csrf") { auth = null; loginDialog(openTools, "Your sign-in expired. Please sign in again."); }
+  else msgDialog("bad", "xcircle", "Nothing was changed", r.json.message || "Could not restore that version.");
 }
 document.getElementById("import-btn").addEventListener("click", () => document.getElementById("import-file").click());
 document.getElementById("import-file").addEventListener("change", (e) => { const f = e.target.files[0]; e.target.value = ""; doImport(f); });
@@ -2758,16 +2873,30 @@ document.addEventListener("click", (e) => {
   if (tr && !e.target.closest("a")) { location.hash = tr.getAttribute("data-href"); return; }
   const t = e.target.closest && e.target.closest("#more");
   if (t) { const open = t.getAttribute("aria-expanded") !== "true"; moreOpen = open; document.getElementById("more-options").hidden = !open; t.setAttribute("aria-expanded", String(open)); t.textContent = open ? "Fewer options" : "More options"; return; }
+  const rs = e.target.closest && e.target.closest("[data-restore]");
+  if (rs) { restoreVersion(rs.getAttribute("data-restore"), rs.getAttribute("data-base")); return; }
   const c = e.target.closest && e.target.closest("[id]");
   const id = c && c.id;
   if (id === "dl-all") downloadProjects(sortProjects(P, "date", "asc"), "All projects");
   else if (id === "dl-filtered") downloadProjects(window.__filtered || [], describeFilters());
+  else if (id === "publish-now") startPublish(false);
+  else if (id === "pub-anyway") startPublish(true);
+  else if (id === "pub-tools") { e.preventDefault(); openTools(); }
+  else if (id === "pub-signout") { api("/api/auth", { method: "DELETE" }).then(() => { auth = null; closeDialog(); }); }
   else if (id === "reset") { e.preventDefault(); try { localStorage.removeItem(STORE); } catch (x) { /* ignore */ } loadInitial(); shell(); location.hash = "#/"; render(); }
 });
 
+/* First paint waits (up to 4 s) for the published data; the built-in data is the fallback. */
 loadInitial();
-shell();
-render();
+document.getElementById("view").innerHTML = '<p class="loading" role="status" style="padding:24px;color:var(--ink-soft)">Loading the latest data...</p>';
+fetchPublished().then((p) => { if (p) published = p; loadInitial(); ready = true; shell(); render(); });
+/* A tab left open picks up a newer publish when it becomes visible again (checked at most once a minute). */
+let lastCheck = Date.now();
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !ready || Date.now() - lastCheck < 60000) return;
+  lastCheck = Date.now();
+  fetchPublished(String(lastCheck)).then((p) => { if (p && (!published || p.version !== published.version)) { published = p; loadInitial(); shell(); render(); } });
+});
 })();
 </script>
 </body>
