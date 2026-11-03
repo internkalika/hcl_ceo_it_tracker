@@ -11,5 +11,10 @@
   },
   "scripts": {
     "test": "node --import ./test/register.mjs --test test/*.test.mjs"
+  },
+  "overrides": {
+    "@vercel/oidc": {
+      "@vercel/cli-config": "0.3.6"
+    }
   }
 }
